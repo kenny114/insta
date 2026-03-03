@@ -20,27 +20,55 @@ export default function ChatContainer() {
     setIsLoading(true);
 
     try {
-      const apiMessages = [...messages, userMessage].map((m) => ({
+      // Start with the current conversation history
+      let apiMessages: unknown[] = [...messages, userMessage].map((m) => ({
         role: m.role,
         content: m.content,
       }));
 
-      const res = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: apiMessages }),
-      });
+      // Keep stepping through tool calls until the AI is done
+      while (true) {
+        const res = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ messages: apiMessages }),
+        });
 
-      const data: ChatResponse = await res.json();
+        if (!res.ok) {
+          throw new Error(`Request failed with status ${res.status}`);
+        }
 
-      const assistantMessage: Message = {
-        id: crypto.randomUUID(),
-        role: "assistant",
-        content: data.message,
-        toolCalls: data.toolCalls,
-      };
+        const data: ChatResponse = await res.json();
 
-      setMessages((prev) => [...prev, assistantMessage]);
+        if (data.continue && data.nextMessages) {
+          // Show tool call results as they arrive
+          if (data.toolCalls && data.toolCalls.length > 0) {
+            setMessages((prev) => [
+              ...prev,
+              {
+                id: crypto.randomUUID(),
+                role: "assistant",
+                content: "",
+                toolCalls: data.toolCalls,
+              },
+            ]);
+          }
+          // Use the updated history (includes tool results) for the next round
+          apiMessages = data.nextMessages;
+        } else {
+          // Final text response
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: crypto.randomUUID(),
+              role: "assistant",
+              content: data.message || "Done.",
+              toolCalls: data.toolCalls,
+            },
+          ]);
+          break;
+        }
+      }
     } catch {
       setMessages((prev) => [
         ...prev,

@@ -18,6 +18,8 @@ export interface ChatRequest {
 }
 
 export interface ChatResponse {
-  message: string;
+  message?: string;
   toolCalls?: ToolCallResult[];
+  continue?: boolean;
+  nextMessages?: unknown[];
 }
