@@ -1,9 +1,42 @@
 "use client";
 
 import { useState } from "react";
-import type { Message, ChatResponse } from "@/lib/types";
+import type { Message, ToolCallResult } from "@/lib/types";
 import MessageList from "./MessageList";
 import ChatInput from "./ChatInput";
+
+interface StreamEvent {
+  type: "tool_running" | "tool_done" | "done";
+  toolCall?: ToolCallResult;
+  message?: string;
+  continue?: boolean;
+  nextMessages?: unknown[];
+}
+
+async function* readStream(response: Response): AsyncGenerator<StreamEvent> {
+  const reader = response.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+
+    for (const line of lines) {
+      if (line.trim()) {
+        yield JSON.parse(line);
+      }
+    }
+  }
+
+  if (buffer.trim()) {
+    yield JSON.parse(buffer);
+  }
+}
 
 export default function ChatContainer() {
   const [messages, setMessages] = useState<Message[]>([]);
@@ -20,13 +53,11 @@ export default function ChatContainer() {
     setIsLoading(true);
 
     try {
-      // Start with the current conversation history
       let apiMessages: unknown[] = [...messages, userMessage].map((m) => ({
         role: m.role,
         content: m.content,
       }));
 
-      // Keep stepping through tool calls until the AI is done
       while (true) {
         const res = await fetch("/api/chat", {
           method: "POST",
@@ -38,34 +69,71 @@ export default function ChatContainer() {
           throw new Error(`Request failed with status ${res.status}`);
         }
 
-        const data: ChatResponse = await res.json();
+        // Track tool calls for this round using a message ID we can update
+        const roundMessageId = crypto.randomUUID();
+        const toolCalls: ToolCallResult[] = [];
+        let finalEvent: StreamEvent | null = null;
 
-        if (data.continue && data.nextMessages) {
-          // Show tool call results as they arrive
-          if (data.toolCalls && data.toolCalls.length > 0) {
+        for await (const event of readStream(res)) {
+          if (event.type === "tool_running" && event.toolCall) {
+            // Add a running tool call card
+            toolCalls.push(event.toolCall);
+            setMessages((prev) => {
+              const filtered = prev.filter((m) => m.id !== roundMessageId);
+              return [
+                ...filtered,
+                {
+                  id: roundMessageId,
+                  role: "assistant",
+                  content: "",
+                  toolCalls: [...toolCalls],
+                },
+              ];
+            });
+          } else if (event.type === "tool_done" && event.toolCall) {
+            // Replace the running entry with the completed result
+            const idx = toolCalls.findIndex(
+              (tc) =>
+                tc.tool === event.toolCall!.tool && tc.status === "running"
+            );
+            if (idx !== -1) {
+              toolCalls[idx] = event.toolCall;
+            } else {
+              toolCalls.push(event.toolCall);
+            }
+            setMessages((prev) => {
+              const filtered = prev.filter((m) => m.id !== roundMessageId);
+              return [
+                ...filtered,
+                {
+                  id: roundMessageId,
+                  role: "assistant",
+                  content: "",
+                  toolCalls: [...toolCalls],
+                },
+              ];
+            });
+          } else if (event.type === "done") {
+            finalEvent = event;
+          }
+        }
+
+        if (!finalEvent) break;
+
+        if (finalEvent.continue && finalEvent.nextMessages) {
+          apiMessages = finalEvent.nextMessages;
+        } else {
+          // Final text response
+          if (finalEvent.message) {
             setMessages((prev) => [
               ...prev,
               {
                 id: crypto.randomUUID(),
                 role: "assistant",
-                content: "",
-                toolCalls: data.toolCalls,
+                content: finalEvent!.message || "Done.",
               },
             ]);
           }
-          // Use the updated history (includes tool results) for the next round
-          apiMessages = data.nextMessages;
-        } else {
-          // Final text response
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: crypto.randomUUID(),
-              role: "assistant",
-              content: data.message || "Done.",
-              toolCalls: data.toolCalls,
-            },
-          ]);
           break;
         }
       }

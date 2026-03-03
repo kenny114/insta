@@ -70,7 +70,7 @@ export default function ToolCallCard({
         </span>
       </div>
       {toolCall.result && (
-        <div className="px-3 py-2 text-white/50 max-h-32 overflow-y-auto">
+        <div className="px-3 py-2 text-white/50">
           <pre className="whitespace-pre-wrap">{toolCall.result}</pre>
         </div>
       )}
