@@ -13,13 +13,19 @@ const toolLabels: Record<string, string> = {
   run_full_pipeline: "Full Pipeline",
 };
 
-function imageUrl(filePath: string) {
-  return `/api/images?path=${encodeURIComponent(filePath)}`;
+function imageUrl(imgSrc: string) {
+  // If it's already a data URL or http URL, use it directly
+  if (imgSrc.startsWith("data:") || imgSrc.startsWith("http")) {
+    return imgSrc;
+  }
+  return `/api/images?path=${encodeURIComponent(imgSrc)}`;
 }
 
-function downloadImage(filePath: string) {
-  const url = imageUrl(filePath);
-  const filename = filePath.split(/[/\\]/).pop() || "image.png";
+function downloadImage(imgSrc: string) {
+  const url = imageUrl(imgSrc);
+  const filename = imgSrc.startsWith("data:")
+    ? "image.png"
+    : imgSrc.split(/[/\\]/).pop() || "image.png";
   const a = document.createElement("a");
   a.href = url;
   a.download = filename;
@@ -72,7 +78,9 @@ export default function ToolCallCard({
         <div className="px-3 py-3 border-t border-white/5">
           <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
             {toolCall.images!.map((imgPath, i) => {
-              const filename = imgPath.split(/[/\\]/).pop() || `image-${i}.png`;
+              const filename = imgPath.startsWith("data:")
+                ? `image-${i + 1}.png`
+                : imgPath.split(/[/\\]/).pop() || `image-${i}.png`;
               return (
                 <div key={i} className="group relative rounded-lg overflow-hidden bg-black/30">
                   <img
