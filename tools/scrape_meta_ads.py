@@ -1,5 +1,6 @@
 """
-Scrape recruitment-related ads from the Meta Ad Library API.
+Scrape recruitment-related ads from Meta Ad Library via Apify.
+Uses curious_coder/facebook-ads-library-scraper which takes Ad Library URLs.
 
 Usage:
     python scrape_meta_ads.py [--service recruitment|performance_management|learning_development]
@@ -10,85 +11,139 @@ Output:
 
 import argparse
 import sys
+import time
 from pathlib import Path
+from urllib.parse import urlencode
 
 sys.path.insert(0, str(Path(__file__).parent))
 from config import (
-    META_ACCESS_TOKEN, META_AD_LIBRARY_BASE_URL,
+    APIFY_API_TOKEN, APIFY_ACTOR_ID,
     RESEARCH_DIR, SERVICE_LINES, MAX_RESEARCH_RESULTS,
 )
-from utils import fetch_json, save_json, download_image, timestamp
+from utils import save_json, timestamp
+import requests
+
+APIFY_BASE = "https://api.apify.com/v2"
+
+
+def _build_ad_library_url(search_term: str, country: str = "US") -> str:
+    params = {
+        "active_status": "all",
+        "ad_type": "all",
+        "country": country,
+        "q": search_term,
+        "search_type": "keyword_unordered",
+        "media_type": "all",
+    }
+    return "https://www.facebook.com/ads/library/?" + urlencode(params)
 
 
 def search_meta_ads(search_terms: list[str], limit: int = 25) -> list[dict]:
-    """Query the Meta Ad Library for ads matching search terms."""
-    if not META_ACCESS_TOKEN:
-        print("WARNING: META_ACCESS_TOKEN not set. Using mock data for development.")
-        return _mock_meta_results(search_terms)
+    """Query Meta Ad Library via Apify actor for ads matching search terms."""
+    if not APIFY_API_TOKEN:
+        print("ERROR: APIFY_API_TOKEN not set in .env")
+        return []
+
+    urls = [_build_ad_library_url(term) for term in search_terms]
+    print(f"  Starting Apify run with {len(urls)} search URLs...")
+
+    payload = {
+        "urls": [{"url": u} for u in urls],
+        "totalNumberOfRecordsRequired": min(limit * len(search_terms), 200),
+    }
+
+    # Start async run
+    try:
+        resp = requests.post(
+            f"{APIFY_BASE}/acts/{APIFY_ACTOR_ID}/runs",
+            params={"token": APIFY_API_TOKEN},
+            json=payload,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        run_data = resp.json()
+        run_id = run_data["data"]["id"]
+        print(f"  Run started: {run_id}")
+    except Exception as e:
+        print(f"  Failed to start Apify run: {e}")
+        return []
+
+    # Poll until finished
+    max_wait = 600  # 10 minutes
+    poll_interval = 15
+    elapsed = 0
+    while elapsed < max_wait:
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+        try:
+            status_resp = requests.get(
+                f"{APIFY_BASE}/acts/{APIFY_ACTOR_ID}/runs/{run_id}",
+                params={"token": APIFY_API_TOKEN},
+                timeout=15,
+            )
+            status_resp.raise_for_status()
+            status = status_resp.json()["data"]["status"]
+            print(f"  [{elapsed}s] Status: {status}")
+            if status == "SUCCEEDED":
+                break
+            elif status in ("FAILED", "ABORTED", "TIMED-OUT"):
+                print(f"  Run ended with status: {status}")
+                return []
+        except Exception as e:
+            print(f"  Polling error: {e}")
+
+    # Fetch results
+    try:
+        items_resp = requests.get(
+            f"{APIFY_BASE}/acts/{APIFY_ACTOR_ID}/runs/{run_id}/dataset/items",
+            params={"token": APIFY_API_TOKEN, "format": "json"},
+            timeout=60,
+        )
+        items_resp.raise_for_status()
+        items = items_resp.json()
+        print(f"  Apify returned {len(items)} ads")
+    except Exception as e:
+        print(f"  Failed to fetch results: {e}")
+        return []
 
     all_ads = []
-    for term in search_terms:
-        params = {
-            "access_token": META_ACCESS_TOKEN,
-            "search_terms": term,
-            "ad_type": "ALL",
-            "ad_reached_countries": ["US", "GB", "AU", "CA"],
-            "fields": "id,ad_creative_bodies,ad_creative_link_titles,ad_creative_link_descriptions,ad_snapshot_url,page_name,publisher_platforms,estimated_audience_size",
-            "limit": min(limit, 50),
-        }
-
-        try:
-            data = fetch_json(META_AD_LIBRARY_BASE_URL, params=params)
-            ads = data.get("data", [])
-            for ad in ads:
-                all_ads.append({
-                    "source": "meta_ad_library",
-                    "search_term": term,
-                    "ad_id": ad.get("id"),
-                    "page_name": ad.get("page_name"),
-                    "bodies": ad.get("ad_creative_bodies", []),
-                    "titles": ad.get("ad_creative_link_titles", []),
-                    "descriptions": ad.get("ad_creative_link_descriptions", []),
-                    "snapshot_url": ad.get("ad_snapshot_url"),
-                    "platforms": ad.get("publisher_platforms", []),
-                    "audience_size": ad.get("estimated_audience_size", {}),
-                })
-            print(f"  Found {len(ads)} ads for '{term}'")
-        except Exception as e:
-            print(f"  Error searching '{term}': {e}")
-
+    for item in items:
+        all_ads.append({
+            "source": "meta_ad_library",
+            "search_term": item.get("searchTerm") or item.get("q", ""),
+            "ad_id": item.get("adArchiveID") or item.get("id"),
+            "page_name": item.get("pageName") or item.get("page_name"),
+            "bodies": _extract_list(item, ["adCreativeBodies", "bodies", "ad_creative_bodies"]),
+            "titles": _extract_list(item, ["adCreativeLinkTitles", "titles", "ad_creative_link_titles"]),
+            "descriptions": _extract_list(item, ["adCreativeLinkDescriptions", "descriptions"]),
+            "snapshot_url": item.get("adSnapshotURL") or item.get("snapshot_url"),
+            "platforms": item.get("publisherPlatform") or item.get("platforms", []),
+            "audience_size": item.get("reachEstimate") or {},
+        })
     return all_ads
 
 
-def _mock_meta_results(search_terms: list[str]) -> list[dict]:
-    """Generate mock results for development/testing without API access."""
-    mock_ads = []
-    for i, term in enumerate(search_terms[:3]):
-        mock_ads.append({
-            "source": "meta_ad_library",
-            "search_term": term,
-            "ad_id": f"mock_{i}",
-            "page_name": f"Sample Recruitment Agency {i+1}",
-            "bodies": [f"We're hiring! Top talent meets top opportunities. {term}. Apply now and take your career to the next level."],
-            "titles": [f"Join Our Team — {term.title()}"],
-            "descriptions": ["Leading recruitment agency helping businesses find the best talent."],
-            "snapshot_url": None,
-            "platforms": ["facebook", "instagram"],
-            "audience_size": {"lower_bound": 10000, "upper_bound": 50000},
-        })
-    return mock_ads
+def _extract_list(item: dict, keys: list[str]) -> list[str]:
+    for key in keys:
+        val = item.get(key)
+        if isinstance(val, list) and val:
+            return val
+    cards = item.get("cards", [])
+    if cards:
+        return [c.get("body", "") or c.get("title", "") for c in cards if c.get("body") or c.get("title")]
+    return []
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Scrape Meta Ad Library for recruitment ads")
+    parser = argparse.ArgumentParser(description="Scrape Meta Ad Library via Apify")
     parser.add_argument("--service", choices=SERVICE_LINES.keys(), default="recruitment",
                         help="Service line to research")
     args = parser.parse_args()
 
     service = SERVICE_LINES[args.service]
-    search_terms = service["keywords"]
+    search_terms = service["keywords"][:4]
 
-    print(f"Researching Meta ads for: {service['name']}")
+    print(f"Researching Meta ads for: {service['name']} (via Apify)")
     print(f"Search terms: {search_terms}")
 
     ads = search_meta_ads(search_terms, limit=MAX_RESEARCH_RESULTS)
